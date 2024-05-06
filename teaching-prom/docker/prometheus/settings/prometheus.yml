@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 10s
+
+scrape_configs:
+
+  # config for the service running on localhost
+  #
+  - job_name: "localhost-service"
+    metrics_path: "/service/metrics"
+    static_configs:
+      # host.docker.internal is machine localhost
+      - targets: ["host.docker.internal:18000"]
+
+  # config for the Prometheus Gateway running inside the container
+  #
+  - job_name: "prom-pushgateway"
+    honor_labels: true
+    static_configs:
+      # our "prometheus-pushgateway" service defined
+      # in the Docker Compose YML
+      #
+      - targets: ["prometheus-pushgateway:9091"]

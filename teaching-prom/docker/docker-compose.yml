@@ -1,0 +1,43 @@
+services:
+
+  # define prometheus DB
+  # 
+  prometheus-tsdb:
+    image: prom/prometheus:v2.38.0
+    volumes:
+      # local ./prometheus
+      - ./prometheus/settings:/etc/prometheus/settings
+      - ./prometheus/data:/prometheus
+    ports:
+      - 19090:9090
+    command:
+      - "--config.file=/etc/prometheus/settings/prometheus.yml"
+      - "--web.console.libraries=/usr/share/prometheus/console_libraries"
+      - "--web.console.templates=/usr/share/prometheus/consoles"
+    restart: unless-stopped
+
+  # define the pushgateway
+  #  for ephemeral metrics
+  #
+  prometheus-pushgateway:
+    image: prom/pushgateway:v1.4.2
+    ports:
+      - 19091:9091
+    depends_on:
+      - prometheus-tsdb
+    restart: unless-stopped
+
+  # define Grafana UI
+  # 
+  grafana:
+    image: grafana/grafana:9.4.3
+    volumes:
+      - ./grafana:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=passw0rd
+    ports:
+      - 13000:3000
+    depends_on:
+      - prometheus-tsdb
+    restart: unless-stopped
