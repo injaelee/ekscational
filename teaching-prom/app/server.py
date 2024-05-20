@@ -1,19 +1,22 @@
-import asyncio
-import aiologger
 from aiologger.handlers.streams import AsyncStreamHandler
-import random
 from fastapi import FastAPI
 from prometheus_client import (
   CONTENT_TYPE_LATEST,
   CollectorRegistry,
   Counter,
   Histogram,
+  Gauge,
   generate_latest,
+  push_to_gateway,
 )
 from starlette.responses import Response
-import uvicorn
-import time
+import aiologger
+import asyncio
 import math
+import random
+import time
+import uuid
+import uvicorn
 
 
 # configure asynchronous logging
@@ -21,7 +24,14 @@ import math
 logger = aiologger.Logger.with_default_handlers()
 
 
+# this is defined in our docker-compose.yml
 #
+PUSH_GATEWAY_URL = "http://localhost:19091"
+
+
+# prom collector registry for metrics
+# - there is a default if you create any metrics without a specific collector registry
+#   - added here just to be explicit and demonstrate the registry concept
 #
 metric_registry = CollectorRegistry()
 
@@ -40,6 +50,18 @@ async def startup_event():
   # simulate the constantly running request
   asyncio.create_task(simulate_requests())
   asyncio.create_task(simulate_seasonal_counts())
+
+  # jobs for demonstrating the push gateway
+  for (job_name, runtime, std) in [
+    ("long_running_job", 600, 30),
+    ("medium_running_job", 300, 30),
+    ("short_running_job", 60, 10),
+  ]:
+    asyncio.create_task(simulate_process_state_change(
+      job_name = job_name,
+      base_run_time_in_seconds = runtime,
+      std = std,
+    ))
 
 
 # Define a route to return a message
@@ -101,12 +123,11 @@ async def simulate_requests():
     status = random.choices(available_status, weights = status_weights, k = 1)[0]
 
     # log duration / observation
-    labeled_req_duration_histogram = REQUEST_DURATION_HISTOGRAM.labels(
+    REQUEST_DURATION_HISTOGRAM.labels(
       method = "POST",
       path = "/magical/method",
       status = status,
-    )
-    labeled_req_duration_histogram.observe(duration)
+    ).observe(duration)
 
     # note: cannot use 'transitions' with aiologger; ie. %f
     await logger.info("simulating duration:[%f]" % duration)
@@ -117,10 +138,10 @@ async def simulate_requests():
 
 def generate_sin_wave(
   time_value: float,
-  amplitude: int = 1,
-  frequency: int = 1,
-  phase_shift: int = 0,
-  vertical_shift: int = 0,
+  amplitude: float = 1.0,
+  frequency: float = 1.0,
+  phase_shift: float = 0.0,
+  vertical_shift: float = 0.0,
 ):
     """
     Generate a sinusoidal value for a given time t.
@@ -155,12 +176,17 @@ RHYTHEMIC_REQUEST_COUNTER = Counter(
 # The Guage metric keeps the value as is until updates or overridden
 #
 async def simulate_seasonal_counts():
-  sampling_rate = 1 # let's keep it at 1 a second
+  sampling_rate = 3.0 # let's keep it at 3 a second
+  frequency = 1/600 # complete a cycle every 10 min (=600s)
   while True:
     current_time = time.time()
     amp_noise = random.randrange(1, 10)
 
-    v = generate_sin_wave(current_time, amplitude = amp_noise)
+    v = generate_sin_wave(
+      current_time,
+      amplitude = amp_noise,
+      frequency = frequency,
+    )
     pod_v = max(v, 0) * 100 # ensure v is positive and 100 multiples
 
     RHYTHEMIC_REQUEST_COUNTER.labels(
@@ -171,13 +197,94 @@ async def simulate_seasonal_counts():
     # note: cannot use 'transitions' with aiologger; ie. %f
     await logger.info("increment by:[%f, %f]" % (v, pod_v))
 
-    await asyncio.sleep(1 / sampling_rate)
+    await asyncio.sleep(1.0 / sampling_rate)
+
+
+async def push_job_status(
+  job: str,
+  status: str,
+):
+  # note: create registry before every push to the Pushgateway,
+  #       ensures each set of metrics is isolcated and prevents the error
+  #       'was collected before with the same name and label values'
+  #
+  job_state_registry = CollectorRegistry()
+  Gauge(
+    "sim_job_status",
+    "Status of simulated job status",
+    labelnames = [
+      "job",
+      "status"
+    ],
+    registry = job_state_registry,
+  ).labels(
+    job = job,
+    status = status,
+  ).set_to_current_time()
+
+  push_to_gateway(
+    PUSH_GATEWAY_URL,
+    job = job,
+    registry = job_state_registry,
+  )
 
 
 # Using Gauge to track state of an entity
 #
-async def simulate_process_state_change():
-  pass
+async def simulate_process_state_change(
+  job_name: str,
+  base_run_time_in_seconds: float,
+  std: float,
+):
+
+  while True:
+    job_state_registry = CollectorRegistry()
+    job_status_gauge = Gauge(
+      "sim_job_status",
+      "Status of simulated job status",
+      labelnames = [
+        "status"
+      ],
+      registry = job_state_registry,
+    )
+    exec_id = str(uuid.uuid4())
+
+    # mark the start
+    job_status_gauge.labels(
+      status = "start",
+    ).set_to_current_time()
+    push_to_gateway(
+      PUSH_GATEWAY_URL,
+      job = job_name,
+      grouping_key = {"exec_id": exec_id},
+      registry = job_state_registry,
+    )
+
+    run_time_s = random.gauss(mu = base_run_time_in_seconds, sigma = std)
+    await logger.info("executing job[%s] with runtime[%f]s" % (job_name, run_time_s))
+    await asyncio.sleep(run_time_s)
+
+    # roll the dice for possible outcomes
+    possible_outcomes = ["failure", "success"]
+    outcome = random.choices(
+      possible_outcomes,
+      weights = [0.1, 0.9],
+      k = 1,
+    )[0]
+
+    await logger.info("done job[%s] with runtime[%f]s with result:[%s]" % (
+      job_name, run_time_s, outcome))
+
+    # mark the final outcome
+    job_status_gauge.labels(
+      status = outcome,
+    ).set_to_current_time()
+    push_to_gateway(
+      PUSH_GATEWAY_URL,
+      job = job_name,
+      grouping_key = {"exec_id": exec_id},
+      registry = job_state_registry,
+    )
 
 
 # Run the FastAPI application
